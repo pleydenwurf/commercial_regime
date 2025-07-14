@@ -1,0 +1,198 @@
+# ansible/templates/rocky-local.repo.j2
+[rocky-baseos]
+name=Rocky Linux $releasever - BaseOS
+baseurl={{ rocky_repo_baseurl }}/baseos/
+enabled=1
+gpgcheck=0
+priority=1
+
+[rocky-appstream]
+name=Rocky Linux $releasever - AppStream
+baseurl={{ rocky_repo_baseurl }}/appstream/
+enabled=1
+gpgcheck=0
+priority=1
+
+[rocky-extras]
+name=Rocky Linux $releasever - Extras
+baseurl={{ rocky_repo_baseurl }}/extras/
+enabled=1
+gpgcheck=0
+priority=1
+
+[epel]
+name=Extra Packages for Enterprise Linux $releasever - $basearch
+baseurl={{ epel_repo_baseurl }}/
+enabled=1
+gpgcheck=0
+priority=1
+
+---
+# ansible/templates/traefik.yml.j2
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+api:
+  dashboard: true
+  debug: true
+  insecure: true
+
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+certificatesResolvers:
+  stepca:
+    acme:
+      email: admin@{{ domain }}
+      storage: /data/acme.json
+      caServer: https://{{ stepca_ip }}/acme/acme/directory
+      httpChallenge:
+        entryPoint: web
+
+log:
+  level: INFO
+
+accessLog: {}
+
+---
+# ansible/templates/dynamic.yml.j2
+http:
+  routers:
+    nginx-router:
+      rule: "Host(`nginx-proxy.{{ domain }}`)"
+      service: nginx-service
+      entryPoints:
+        - web
+        - websecure
+      tls:
+        certResolver: stepca
+
+  services:
+    nginx-service:
+      loadBalancer:
+        servers:
+          - url: "http://{{ nginx_ip }}:80"
+
+---
+# ansible/templates/traefik-compose.yml.j2
+version: '3.7'
+
+services:
+  traefik:
+    image: traefik:v3.0
+    container_name: traefik
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
+    volumes:
+      - /etc/traefik:/etc/traefik:ro
+      - /var/lib/traefik:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command:
+      - --configFile=/etc/traefik/traefik.yml
+
+---
+# ansible/templates/nginx.conf.j2
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log;
+pid /run/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
+
+    access_log /var/log/nginx/access.log main;
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    include /etc/nginx/sites-enabled/*;
+}
+
+---
+# ansible/templates/nginx-site.conf.j2
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html index.htm;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    location /stepca {
+        proxy_pass https://{{ stepca_ip }};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_ssl_verify off;
+    }
+
+    error_page 404 /404.html;
+    location = /404.html {
+        internal;
+    }
+
+    error_page 500 502 503 504 /50x.html;
+    location = /50x.html {
+        internal;
+    }
+}
+
+---
+# ansible/templates/step-ca.service.j2
+[Unit]
+Description=Step CA Certificate Authority
+After=network.target
+
+[Service]
+Type=simple
+User={{ stepca_user }}
+Group={{ stepca_user }}
+Environment=STEPPATH={{ stepca_data_dir }}
+ExecStart=/usr/local/bin/step-ca {{ stepca_data_dir }}/config/ca.json
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
+---
+# ansible/templates/daemon.json.j2
+{
+    "insecure-registries": ["{{ artifactory_url }}"],
+    "registry-mirrors": ["{{ artifactory_url }}/docker-hub/"],
+    "log-driver": "json-file",
+    "log-opts": {
+        "max-size": "10m",
+        "max-file": "3"
+    }
+}
