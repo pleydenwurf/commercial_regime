@@ -1,0 +1,128 @@
+# ansible/site.yml - Main orchestration playbook
+---
+- name: Configure all VMs with base settings
+  hosts: all
+  become: yes
+  gather_facts: true
+  vars:
+    artifactory_url: "{{ hostvars['localhost']['artifactory_url'] }}"
+    
+  tasks:
+    - name: Update /etc/hosts for offline resolution
+      copy:
+        src: files/hosts
+        dest: /etc/hosts
+        backup: yes
+        
+    - name: Configure Artifactory repository
+      copy:
+        content: |
+          [artifactory]
+          name=Local Artifactory
+          baseurl={{ artifactory_url }}/artifactory/rocky-linux-9/
+          enabled=1
+          gpgcheck=0
+        dest: /etc/yum.repos.d/artifactory.repo
+        
+    - name: Install base packages from Artifactory
+      dnf:
+        name:
+          - curl
+          - wget
+          - vim
+          - htop
+          - firewalld
+          - chrony
+        state: present
+        
+    - name: Start and enable base services
+      systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop:
+        - firewalld
+        - chronyd
+
+- name: Configure Step CA Server
+  hosts: step_ca_servers
+  become: yes
+  vars:
+    step_ca_port: 9000
+    step_ca_data_dir: /opt/step-ca
+    ca_name: "Internal CA"
+    ca_dns: "ca.{{ domain }}"
+    
+  tasks:
+    - name: Create step-ca user
+      user:
+        name: step-ca
+        system: yes
+        shell: /bin/false
+        home: "{{ step_ca_data_dir }}"
+        create_home: yes
+        
+    - name: Create step-ca directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: step-ca
+        group: step-ca
+        mode: '0755'
+      loop:
+        - "{{ step_ca_data_dir }}"
+        - "{{ step_ca_data_dir }}/config"
+        - "{{ step_ca_data_dir }}/certs"
+        - "{{ step_ca_data_dir }}/secrets"
+        
+    - name: Download Step CA binary from Artifactory
+      get_url:
+        url: "{{ artifactory_url }}/artifactory/step-binaries/step-ca"
+        dest: /usr/local/bin/step-ca
+        mode: '0755'
+        owner: root
+        group: root
+        
+    - name: Download Step CLI binary from Artifactory
+      get_url:
+        url: "{{ artifactory_url }}/artifactory/step-binaries/step"
+        dest: /usr/local/bin/step
+        mode: '0755'
+        owner: root
+        group: root
+        
+    - name: Initialize Step CA
+      shell: |
+        cd {{ step_ca_data_dir }}
+        /usr/local/bin/step ca init \
+          --name="{{ ca_name }}" \
+          --dns="{{ ca_dns }}" \
+          --address=":{{ step_ca_port }}" \
+          --provisioner=admin \
+          --password-file=<(echo "changeme123") \
+          --provisioner-password-file=<(echo "changeme123") \
+          --acme
+      args:
+        executable: /bin/bash
+        creates: "{{ step_ca_data_dir }}/config/ca.json"
+      become_user: step-ca
+      
+    - name: Configure Step CA for ACME
+      replace:
+        path: "{{ step_ca_data_dir }}/config/ca.json"
+        regexp: '"acme": {[^}]*}'
+        replace: |
+          "acme": {
+            "challenges": ["http-01"],
+            "requireEAB": false
+          }
+      become_user: step-ca
+      
+    - name: Create Step CA systemd service
+      copy:
+        content: |
+          [Unit]
+          Description=Step CA Certificate Authority
+          After=network.target
+          
+          [Service]
