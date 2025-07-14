@@ -1,128 +1,304 @@
-# ansible/site.yml - Main orchestration playbook
+# ansible/site.yml
 ---
-- name: Configure all VMs with base settings
+- name: Configure all servers
   hosts: all
   become: yes
-  gather_facts: true
+  gather_facts: yes
   vars:
-    artifactory_url: "{{ hostvars['localhost']['artifactory_url'] }}"
+    rocky_repo_baseurl: "{{ artifactory_url }}/rocky-linux/$releasever/$basearch"
+    epel_repo_baseurl: "{{ artifactory_url }}/epel/$releasever/$basearch"
+    docker_repo_baseurl: "{{ artifactory_url }}/docker-ce/$releasever/$basearch"
     
   tasks:
-    - name: Update /etc/hosts for offline resolution
-      copy:
-        src: files/hosts
-        dest: /etc/hosts
+    - name: Configure local package repositories
+      template:
+        src: "templates/rocky-local.repo.j2"
+        dest: "/etc/yum.repos.d/rocky-local.repo"
         backup: yes
-        
-    - name: Configure Artifactory repository
-      copy:
-        content: |
-          [artifactory]
-          name=Local Artifactory
-          baseurl={{ artifactory_url }}/artifactory/rocky-linux-9/
-          enabled=1
-          gpgcheck=0
-        dest: /etc/yum.repos.d/artifactory.repo
-        
-    - name: Install base packages from Artifactory
-      dnf:
+      notify: refresh yum cache
+
+    - name: Update system packages
+      yum:
+        name: "*"
+        state: latest
+        update_cache: yes
+
+    - name: Install common packages
+      yum:
         name:
-          - curl
           - wget
+          - curl
           - vim
           - htop
+          - net-tools
           - firewalld
           - chrony
         state: present
-        
-    - name: Start and enable base services
+
+    - name: Start and enable firewalld
       systemd:
-        name: "{{ item }}"
+        name: firewalld
         state: started
         enabled: yes
-      loop:
-        - firewalld
-        - chronyd
 
-- name: Configure Step CA Server
-  hosts: step_ca_servers
+    - name: Start and enable chrony
+      systemd:
+        name: chronyd
+        state: started
+        enabled: yes
+
+    - name: Configure hostname
+      hostname:
+        name: "{{ inventory_hostname }}.{{ domain }}"
+
+  handlers:
+    - name: refresh yum cache
+      yum:
+        update_cache: yes
+
+- name: Configure Traefik server
+  hosts: traefik
   become: yes
   vars:
-    step_ca_port: 9000
-    step_ca_data_dir: /opt/step-ca
-    ca_name: "Internal CA"
-    ca_dns: "ca.{{ domain }}"
+    traefik_version: "3.0"
+    traefik_config_dir: "/etc/traefik"
+    traefik_data_dir: "/var/lib/traefik"
     
   tasks:
-    - name: Create step-ca user
+    - name: Install Docker
+      include_tasks: tasks/install_docker.yml
+
+    - name: Create traefik directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - "{{ traefik_config_dir }}"
+        - "{{ traefik_data_dir }}"
+
+    - name: Create traefik configuration
+      template:
+        src: "templates/traefik.yml.j2"
+        dest: "{{ traefik_config_dir }}/traefik.yml"
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart traefik
+
+    - name: Create dynamic configuration
+      template:
+        src: "templates/dynamic.yml.j2"
+        dest: "{{ traefik_config_dir }}/dynamic.yml"
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart traefik
+
+    - name: Create docker-compose for Traefik
+      template:
+        src: "templates/traefik-compose.yml.j2"
+        dest: "/opt/traefik-compose.yml"
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart traefik
+
+    - name: Configure firewall for Traefik
+      firewalld:
+        port: "{{ item }}"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop:
+        - "80/tcp"
+        - "443/tcp"
+        - "8080/tcp"
+
+    - name: Start Traefik container
+      shell: |
+        cd /opt
+        docker-compose -f traefik-compose.yml up -d
+      notify: restart traefik
+
+  handlers:
+    - name: restart traefik
+      shell: |
+        cd /opt
+        docker-compose -f traefik-compose.yml down
+        docker-compose -f traefik-compose.yml up -d
+
+- name: Configure Nginx reverse proxy
+  hosts: nginx
+  become: yes
+  vars:
+    nginx_config_dir: "/etc/nginx"
+    nginx_sites_dir: "/etc/nginx/sites-available"
+    nginx_enabled_dir: "/etc/nginx/sites-enabled"
+    
+  tasks:
+    - name: Install Nginx
+      yum:
+        name: nginx
+        state: present
+
+    - name: Create nginx directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - "{{ nginx_sites_dir }}"
+        - "{{ nginx_enabled_dir }}"
+
+    - name: Configure nginx main config
+      template:
+        src: "templates/nginx.conf.j2"
+        dest: "{{ nginx_config_dir }}/nginx.conf"
+        owner: root
+        group: root
+        mode: '0644'
+        backup: yes
+      notify: restart nginx
+
+    - name: Create nginx site configuration
+      template:
+        src: "templates/nginx-site.conf.j2"
+        dest: "{{ nginx_sites_dir }}/default"
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart nginx
+
+    - name: Enable nginx site
+      file:
+        src: "{{ nginx_sites_dir }}/default"
+        dest: "{{ nginx_enabled_dir }}/default"
+        state: link
+      notify: restart nginx
+
+    - name: Configure firewall for Nginx
+      firewalld:
+        port: "{{ item }}"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop:
+        - "80/tcp"
+        - "443/tcp"
+
+    - name: Start and enable Nginx
+      systemd:
+        name: nginx
+        state: started
+        enabled: yes
+
+  handlers:
+    - name: restart nginx
+      systemd:
+        name: nginx
+        state: restarted
+
+- name: Configure Step CA server
+  hosts: stepca
+  become: yes
+  vars:
+    stepca_user: "step"
+    stepca_home: "/home/step"
+    stepca_config_dir: "/etc/step-ca"
+    stepca_data_dir: "/var/lib/step-ca"
+    
+  tasks:
+    - name: Create step user
       user:
-        name: step-ca
-        system: yes
-        shell: /bin/false
-        home: "{{ step_ca_data_dir }}"
+        name: "{{ stepca_user }}"
+        home: "{{ stepca_home }}"
+        shell: /bin/bash
         create_home: yes
-        
+
     - name: Create step-ca directories
       file:
         path: "{{ item }}"
         state: directory
-        owner: step-ca
-        group: step-ca
+        owner: "{{ stepca_user }}"
+        group: "{{ stepca_user }}"
         mode: '0755'
       loop:
-        - "{{ step_ca_data_dir }}"
-        - "{{ step_ca_data_dir }}/config"
-        - "{{ step_ca_data_dir }}/certs"
-        - "{{ step_ca_data_dir }}/secrets"
-        
-    - name: Download Step CA binary from Artifactory
+        - "{{ stepca_config_dir }}"
+        - "{{ stepca_data_dir }}"
+
+    - name: Download step-ca binary
       get_url:
-        url: "{{ artifactory_url }}/artifactory/step-binaries/step-ca"
-        dest: /usr/local/bin/step-ca
-        mode: '0755'
+        url: "{{ artifactory_url }}/step-ca/step-ca_linux_amd64.tar.gz"
+        dest: "/tmp/step-ca.tar.gz"
         owner: root
         group: root
-        
-    - name: Download Step CLI binary from Artifactory
-      get_url:
-        url: "{{ artifactory_url }}/artifactory/step-binaries/step"
-        dest: /usr/local/bin/step
-        mode: '0755'
+        mode: '0644'
+
+    - name: Extract step-ca binary
+      unarchive:
+        src: "/tmp/step-ca.tar.gz"
+        dest: "/usr/local/bin"
+        remote_src: yes
         owner: root
         group: root
-        
-    - name: Initialize Step CA
+        mode: '0755'
+
+    - name: Download step CLI
+      get_url:
+        url: "{{ artifactory_url }}/step-cli/step_linux_amd64.tar.gz"
+        dest: "/tmp/step-cli.tar.gz"
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Extract step CLI
+      unarchive:
+        src: "/tmp/step-cli.tar.gz"
+        dest: "/usr/local/bin"
+        remote_src: yes
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Initialize step-ca
+      become_user: "{{ stepca_user }}"
       shell: |
-        cd {{ step_ca_data_dir }}
-        /usr/local/bin/step ca init \
-          --name="{{ ca_name }}" \
-          --dns="{{ ca_dns }}" \
-          --address=":{{ step_ca_port }}" \
-          --provisioner=admin \
-          --password-file=<(echo "changeme123") \
-          --provisioner-password-file=<(echo "changeme123") \
-          --acme
+        export STEPPATH={{ stepca_data_dir }}
+        step ca init --name="Internal CA" --dns="{{ stepca_ip }},stepca-server.{{ domain }}" --address=":443" --provisioner="admin@{{ domain }}"
       args:
-        executable: /bin/bash
-        creates: "{{ step_ca_data_dir }}/config/ca.json"
-      become_user: step-ca
-      
-    - name: Configure Step CA for ACME
-      replace:
-        path: "{{ step_ca_data_dir }}/config/ca.json"
-        regexp: '"acme": {[^}]*}'
-        replace: |
-          "acme": {
-            "challenges": ["http-01"],
-            "requireEAB": false
-          }
-      become_user: step-ca
-      
-    - name: Create Step CA systemd service
-      copy:
-        content: |
-          [Unit]
-          Description=Step CA Certificate Authority
-          After=network.target
-          
-          [Service]
+        creates: "{{ stepca_data_dir }}/config/ca.json"
+
+    - name: Create step-ca systemd service
+      template:
+        src: "templates/step-ca.service.j2"
+        dest: "/etc/systemd/system/step-ca.service"
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart step-ca
+
+    - name: Configure firewall for Step CA
+      firewalld:
+        port: "443/tcp"
+        permanent: yes
+        state: enabled
+        immediate: yes
+
+    - name: Start and enable step-ca
+      systemd:
+        name: step-ca
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+  handlers:
+    - name: restart step-ca
+      systemd:
+        name: step-ca
+        state: restarted
+        daemon_reload: yes
