@@ -1,0 +1,25 @@
+# terraform/terraform.tfvars.example
+# Copy this file to terraform.tfvars and update with your values
+
+vsphere_user     = "administrator@vsphere.local"
+vsphere_password = "your_password_here"
+vsphere_server   = "vcenter.local.lab"
+
+datacenter    = "Datacenter"
+datastore     = "datastore1"
+cluster       = "Cluster"
+network       = "VM Network"
+template_name = "rocky-linux-96-template"
+vm_folder     = "Infrastructure"
+
+domain = "local.lab"
+
+traefik_ip = "192.168.1.10"
+nginx_ip   = "192.168.1.11"
+stepca_ip  = "192.168.1.12"
+
+netmask = 24
+gateway = "192.168.1.1"
+dns_servers = ["192.168.1.1", "8.8.8.8"]
+
+artifactory_url = "https://artifactory.local.lab"
