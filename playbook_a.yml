@@ -1,390 +1,138 @@
 ---
-- name: Deploy Traefik Reverse Proxy with ACME on Rocky Linux 9.6
-  hosts: localhost
-  gather_facts: false
-  vars:
-    # vSphere Configuration
-    vcenter_hostname: "{{ vcenter_host }}"
-    vcenter_username: "{{ vcenter_user }}"
-    vcenter_password: "{{ vcenter_pass }}"
-    datacenter_name: "{{ datacenter }}"
-    cluster_name: "{{ cluster }}"
-    folder_name: "{{ vm_folder | default('') }}"
-    
-    # VM Configuration
-    vm_name: "traefik-proxy"
-    vm_template: "rocky-linux-9.6-template"
-    vm_cpu: 2
-    vm_memory: 4096
-    vm_disk_size: 40
-    vm_network: "{{ network_name }}"
-    
-    # Traefik Configuration
-    traefik_version: "v3.0"
-    domain_name: "{{ domain }}"
-    email: "{{ acme_email }}"
-    traefik_api_port: 8080
-    
-    # Sample backend service
-    backend_service_name: "nginx-backend"
-    backend_port: 80
-
-  tasks:
-    - name: Create VM from template
-      community.vmware.vmware_guest:
-        hostname: "{{ vcenter_hostname }}"
-        username: "{{ vcenter_username }}"
-        password: "{{ vcenter_password }}"
-        validate_certs: false
-        datacenter: "{{ datacenter_name }}"
-        cluster: "{{ cluster_name }}"
-        folder: "{{ folder_name }}"
-        name: "{{ vm_name }}"
-        template: "{{ vm_template }}"
-        state: poweredon
-        hardware:
-          memory_mb: "{{ vm_memory }}"
-          num_cpus: "{{ vm_cpu }}"
-        disk:
-          - size_gb: "{{ vm_disk_size }}"
-            type: thin
-            datastore: "{{ datastore_name }}"
-        networks:
-          - name: "{{ vm_network }}"
-            device_type: vmxnet3
-        wait_for_ip_address: true
-        wait_for_ip_address_timeout: 600
-      register: vm_info
-
-    - name: Add VM to inventory
-      add_host:
-        name: "{{ vm_info.instance.ipv4 }}"
-        groups: traefik_servers
-        ansible_host: "{{ vm_info.instance.ipv4 }}"
-        ansible_user: "{{ vm_user | default('root') }}"
-        ansible_ssh_private_key_file: "{{ ssh_key_file }}"
-
-    - name: Wait for SSH to be available
-      wait_for:
-        host: "{{ vm_info.instance.ipv4 }}"
-        port: 22
-        timeout: 300
-
-- name: Configure Traefik Reverse Proxy
-  hosts: traefik_servers
+- hosts: rocky_linux_servers
   become: yes
   vars:
-    traefik_version: "v3.0"
-    domain_name: "{{ domain }}"
-    email: "{{ acme_email }}"
-    traefik_api_port: 8080
-    backend_service_name: "nginx-backend"
-    backend_port: 80
-
+    artifactory_url: "https://your-artifactory.company.com"
+    
   tasks:
-    - name: Update system packages
-      dnf:
-        name: "*"
-        state: latest
-        update_cache: yes
-
-    - name: Install required packages
+    - name: Verify Rocky Linux 9
+      assert:
+        that:
+          - ansible_distribution == "Rocky"
+          - ansible_distribution_major_version == "9"
+        fail_msg: "This playbook requires Rocky Linux 9"
+        
+    - name: Configure DNF repositories to use Artifactory
+      copy:
+        content: |
+          [rocky-baseos-internal]
+          name=Rocky Linux 9 - BaseOS (Internal)
+          baseurl={{ artifactory_url }}/artifactory/rockylinux-9/BaseOS/x86_64/os/
+          enabled=1
+          gpgcheck=1
+          gpgkey={{ artifactory_url }}/artifactory/rockylinux-9/RPM-GPG-KEY-rockyofficial
+          
+          [rocky-appstream-internal]
+          name=Rocky Linux 9 - AppStream (Internal)
+          baseurl={{ artifactory_url }}/artifactory/rockylinux-9/AppStream/x86_64/os/
+          enabled=1
+          gpgcheck=1
+          gpgkey={{ artifactory_url }}/artifactory/rockylinux-9/RPM-GPG-KEY-rockyofficial
+        dest: /etc/yum.repos.d/rocky-internal.repo
+        
+    - name: Install nginx-acme dependencies only
       dnf:
         name:
-          - docker
-          - docker-compose
-          - firewalld
-          - curl
-          - wget
+          - python3
+          - python3-pip
+          - python3-devel
+          - gcc
+          - openssl-devel
+          - libffi-devel
+          - nginx
+          # Note: NO certbot or acme.sh - nginx-acme handles ACME protocol directly
         state: present
-
-    - name: Start and enable Docker service
-      systemd:
-        name: docker
-        state: started
-        enabled: yes
-
-    - name: Start and enable firewalld
-      systemd:
-        name: firewalld
-        state: started
-        enabled: yes
-
-    - name: Configure firewall rules
-      firewalld:
-        port: "{{ item }}"
-        permanent: yes
-        state: enabled
-        immediate: yes
-      loop:
-        - "80/tcp"
-        - "443/tcp"
-        - "8080/tcp"
-
-    - name: Create traefik system user
+        
+    - name: Configure pip for Rocky Linux
+      copy:
+        content: |
+          [global]
+          index-url = {{ artifactory_url }}/artifactory/api/pypi/pypi/simple
+          trusted-host = your-artifactory.company.com
+        dest: /etc/pip.conf
+        
+    - name: Create nginx-acme user
       user:
-        name: traefik
+        name: nginx-acme
         system: yes
         shell: /bin/false
-        home: /opt/traefik
+        home: /opt/nginx-acme
         create_home: yes
-
-    - name: Create traefik directories
+        
+    - name: Configure nginx for ACME challenges
+      copy:
+        content: |
+          # ACME challenge location - nginx-acme will manage this
+          location /.well-known/acme-challenge/ {
+              root /var/lib/nginx-acme/challenges;
+              try_files $uri =404;
+          }
+        dest: /etc/nginx/conf.d/acme-challenge.conf
+      notify: reload nginx
+      
+    - name: Create ACME challenge directory
       file:
-        path: "{{ item }}"
+        path: /var/lib/nginx-acme/challenges/.well-known/acme-challenge
         state: directory
-        owner: traefik
-        group: traefik
+        owner: nginx-acme
+        group: nginx
         mode: '0755'
-      loop:
-        - /opt/traefik
-        - /opt/traefik/config
-        - /opt/traefik/data
-        - /opt/traefik/logs
-
-    - name: Create traefik configuration file
-      copy:
-        content: |
-          # Traefik Configuration
-          global:
-            checkNewVersion: false
-            sendAnonymousUsage: false
-
-          serversTransport:
-            insecureSkipVerify: true
-
-          entryPoints:
-            web:
-              address: ":80"
-              http:
-                redirections:
-                  entrypoint:
-                    to: websecure
-                    scheme: https
-                    permanent: true
-            websecure:
-              address: ":443"
-              http:
-                tls:
-                  certResolver: letsencrypt
-            traefik:
-              address: ":8080"
-
-          providers:
-            docker:
-              endpoint: "unix:///var/run/docker.sock"
-              exposedByDefault: false
-            file:
-              directory: /config
-              watch: true
-
-          certificatesResolvers:
-            letsencrypt:
-              acme:
-                email: {{ email }}
-                storage: /data/acme.json
-                httpChallenge:
-                  entryPoint: web
-
-          api:
-            dashboard: true
-            debug: true
-
-          log:
-            level: INFO
-            filePath: /logs/traefik.log
-
-          accessLog:
-            filePath: /logs/access.log
-        dest: /opt/traefik/config/traefik.yml
-        owner: traefik
-        group: traefik
-        mode: '0644'
-
-    - name: Create dynamic configuration file
-      copy:
-        content: |
-          http:
-            routers:
-              api:
-                rule: "Host(`traefik.{{ domain_name }}`)"
-                service: api@internal
-                middlewares:
-                  - auth
-                tls:
-                  certResolver: letsencrypt
-
-            middlewares:
-              auth:
-                basicAuth:
-                  users:
-                    - "admin:$2y$10$2b2cu2l/7SJnDdLBWyJYMevUDJNQhkpQkn2oqm3MJZv6hzBFkpUV6"  # admin:admin
-        dest: /opt/traefik/config/dynamic.yml
-        owner: traefik
-        group: traefik
-        mode: '0644'
-
-    - name: Create ACME data file
-      file:
-        path: /opt/traefik/data/acme.json
-        state: touch
-        owner: traefik
-        group: traefik
-        mode: '0600'
-
-    - name: Create docker-compose file
-      copy:
-        content: |
-          version: '3.8'
-
-          services:
-            traefik:
-              image: traefik:{{ traefik_version }}
-              container_name: traefik
-              restart: unless-stopped
-              command:
-                - --configfile=/config/traefik.yml
-              ports:
-                - "80:80"
-                - "443:443"
-                - "8080:8080"
-              volumes:
-                - /var/run/docker.sock:/var/run/docker.sock:ro
-                - /opt/traefik/config:/config:ro
-                - /opt/traefik/data:/data
-                - /opt/traefik/logs:/logs
-              environment:
-                - TRAEFIK_LOG_LEVEL=INFO
-              labels:
-                - "traefik.enable=true"
-                - "traefik.http.routers.traefik.rule=Host(`traefik.{{ domain_name }}`)"
-                - "traefik.http.routers.traefik.entrypoints=websecure"
-                - "traefik.http.routers.traefik.tls.certresolver=letsencrypt"
-                - "traefik.http.routers.traefik.service=api@internal"
-                - "traefik.http.routers.traefik.middlewares=auth"
-                - "traefik.http.middlewares.auth.basicauth.users=admin:$$2y$$10$$2b2cu2l/7SJnDdLBWyJYMevUDJNQhkpQkn2oqm3MJZv6hzBFkpUV6"
-              networks:
-                - traefik
-
-            # Sample backend service (nginx)
-            nginx-backend:
-              image: nginx:alpine
-              container_name: {{ backend_service_name }}
-              restart: unless-stopped
-              volumes:
-                - ./nginx-html:/usr/share/nginx/html:ro
-              labels:
-                - "traefik.enable=true"
-                - "traefik.http.routers.nginx.rule=Host(`app.{{ domain_name }}`)"
-                - "traefik.http.routers.nginx.entrypoints=websecure"
-                - "traefik.http.routers.nginx.tls.certresolver=letsencrypt"
-                - "traefik.http.services.nginx.loadbalancer.server.port=80"
-              networks:
-                - traefik
-
-          networks:
-            traefik:
-              external: false
-        dest: /opt/traefik/docker-compose.yml
-        owner: traefik
-        group: traefik
-        mode: '0644'
-
-    - name: Create sample nginx content directory
-      file:
-        path: /opt/traefik/nginx-html
-        state: directory
-        owner: traefik
-        group: traefik
-        mode: '0755'
-
-    - name: Create sample index.html
-      copy:
-        content: |
-          <!DOCTYPE html>
-          <html>
-          <head>
-              <title>Traefik Reverse Proxy - Backend Service</title>
-              <style>
-                  body { font-family: Arial, sans-serif; text-align: center; margin: 50px; }
-                  .container { max-width: 600px; margin: 0 auto; }
-                  .status { color: green; font-weight: bold; }
-              </style>
-          </head>
-          <body>
-              <div class="container">
-                  <h1>🚀 Traefik Reverse Proxy</h1>
-                  <h2>Backend Service Running</h2>
-                  <p class="status">✅ Successfully proxied through Traefik</p>
-                  <p>This is a sample backend service running behind Traefik reverse proxy.</p>
-                  <p>SSL certificate automatically managed by Let's Encrypt ACME.</p>
-                  <hr>
-                  <p><strong>Server:</strong> {{ ansible_hostname }}</p>
-                  <p><strong>IP Address:</strong> {{ ansible_default_ipv4.address }}</p>
-                  <p><strong>Domain:</strong> app.{{ domain_name }}</p>
-              </div>
-          </body>
-          </html>
-        dest: /opt/traefik/nginx-html/index.html
-        owner: traefik
-        group: traefik
-        mode: '0644'
-
-    - name: Create traefik systemd service
+        recurse: yes
+        
+    - name: Install nginx-acme systemd service
       copy:
         content: |
           [Unit]
-          Description=Traefik Reverse Proxy
-          After=docker.service
-          Requires=docker.service
-
+          Description=NGINX ACME Certificate Manager
+          After=network.target nginx.service
+          Wants=nginx.service
+          
           [Service]
-          Type=oneshot
-          RemainAfterExit=yes
-          WorkingDirectory=/opt/traefik
-          ExecStart=/usr/bin/docker-compose up -d
-          ExecStop=/usr/bin/docker-compose down
-          ExecReload=/usr/bin/docker-compose restart
-          User=traefik
-          Group=traefik
-
+          Type=simple
+          User=nginx-acme
+          Group=nginx-acme
+          WorkingDirectory=/opt/nginx-acme
+          ExecStart=/opt/nginx-acme/bin/nginx-acme --config /etc/nginx-acme/config.json
+          Restart=always
+          RestartSec=10
+          
+          # Allow nginx-acme to reload nginx configuration
+          ExecReload=/bin/kill -HUP $MAINPID
+          
           [Install]
           WantedBy=multi-user.target
-        dest: /etc/systemd/system/traefik.service
-        mode: '0644'
-
-    - name: Add traefik user to docker group
-      user:
-        name: traefik
-        groups: docker
-        append: yes
-
-    - name: Reload systemd daemon
+        dest: /etc/systemd/system/nginx-acme.service
+      notify: reload systemd
+      
+    - name: Configure SELinux for nginx-acme (no certbot policies needed)
+      seboolean:
+        name: httpd_can_network_connect
+        state: yes
+        persistent: yes
+      when: ansible_selinux.status == "enabled"
+      
+    - name: Create nginx-acme configuration
+      copy:
+        content: |
+          {
+            "acme_directory": "https://acme-v02.api.letsencrypt.org/directory",
+            "account_key_path": "/etc/nginx-acme/account.key",
+            "challenge_dir": "/var/lib/nginx-acme/challenges",
+            "certificate_dir": "/etc/nginx-acme/certs",
+            "nginx_config_dir": "/etc/nginx/conf.d",
+            "reload_command": "systemctl reload nginx",
+            "domains": []
+          }
+        dest: /etc/nginx-acme/config.json
+        owner: nginx-acme
+        group: nginx-acme
+        mode: '0600'
+        
+  handlers:
+    - name: reload systemd
       systemd:
         daemon_reload: yes
-
-    - name: Enable and start traefik service
+    - name: reload nginx
       systemd:
-        name: traefik
-        state: started
-        enabled: yes
-
-    - name: Wait for Traefik to be ready
-      uri:
-        url: "http://{{ ansible_default_ipv4.address }}:8080/ping"
-        method: GET
-        timeout: 10
-      register: traefik_health
-      until: traefik_health.status == 200
-      retries: 30
-      delay: 10
-
-    - name: Display deployment information
-      debug:
-        msg:
-          - "Traefik reverse proxy deployed successfully!"
-          - "Traefik Dashboard: https://traefik.{{ domain_name }}:8080"
-          - "Sample Backend: https://app.{{ domain_name }}"
-          - "VM IP Address: {{ ansible_default_ipv4.address }}"
-          - "SSL certificates will be automatically obtained from Let's Encrypt"
-          - "Dashboard credentials: admin/admin (change in production!)"
+        name: nginx
+        state: reloaded
