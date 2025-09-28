@@ -1,0 +1,40 @@
+variables:
+  DOCKER_REGISTRY: "your-artifactory.company.com/docker"
+  DNF_REPO_BASE: "https://your-artifactory.company.com/artifactory/rockylinux-9"
+  PIP_INDEX_URL: "https://your-artifactory.company.com/artifactory/api/pypi/pypi/simple"
+  
+stages:
+  - build
+  - test
+  - package
+  - deploy
+
+build-nginx-acme:
+  stage: build
+  image: ${DOCKER_REGISTRY}/rockylinux:9
+  before_script:
+    # Configure DNF to use internal mirrors
+    - echo "baseurl=${DNF_REPO_BASE}/BaseOS/x86_64/os/" > /etc/yum.repos.d/rocky-baseos-internal.repo
+    - echo "baseurl=${DNF_REPO_BASE}/AppStream/x86_64/os/" > /etc/yum.repos.d/rocky-appstream-internal.repo
+    - dnf update -y
+    - dnf install -y python3 python3-pip python3-devel gcc openssl-devel libffi-devel
+    - dnf groupinstall -y "Development Tools"
+  script:
+    - pip3 install --index-url $PIP_INDEX_URL --trusted-host your-artifactory.company.com -r requirements.txt
+    - python3 setup.py build
+    - python3 setup.py install --prefix=/opt/nginx-acme
+  artifacts:
+    paths:
+      - /opt/nginx-acme/
+      - dist/
+    expire_in: 1 hour
+
+package-rpm:
+  stage: package
+  image: ${DOCKER_REGISTRY}/rockylinux:9
+  script:
+    - dnf install -y rpm-build rpmdevtools
+    - rpmbuild -ba nginx-acme.spec
+  artifacts:
+    paths:
+      - rpmbuild/RPMS/
