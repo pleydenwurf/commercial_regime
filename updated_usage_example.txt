@@ -1,0 +1,9 @@
+# Add a new domain to be managed
+/usr/local/bin/nginx-acme-manager.sh app.internal.company.com
+
+# nginx-acme will:
+# 1. Contact step-CA ACME server
+# 2. Complete HTTP-01 challenge
+# 3. Receive certificate from internal CA
+# 4. Update nginx configuration
+# 5. Reload nginx with new certificate

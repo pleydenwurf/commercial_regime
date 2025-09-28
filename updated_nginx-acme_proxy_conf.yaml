@@ -1,0 +1,205 @@
+---
+- hosts: nginx_acme_proxies
+  become: yes
+  vars:
+    artifactory_url: "https://your-artifactory.company.com"
+    step_ca_acme_url: "{{ hostvars[groups['step_ca_servers'][0]]['ansible_default_ipv4']['address'] }}:9000"
+    
+  tasks:
+    - name: Install nginx-acme dependencies
+      dnf:
+        name:
+          - python3
+          - python3-pip
+          - python3-devel
+          - gcc
+          - openssl-devel
+          - libffi-devel
+          - nginx
+        state: present
+        
+    - name: Install nginx-acme from build artifacts
+      unarchive:
+        src: "{{ artifactory_url }}/generic/nginx-acme/nginx-acme-latest.tar.gz"
+        dest: /opt/
+        remote_src: yes
+        owner: root
+        group: root
+        creates: /opt/nginx-acme/bin/nginx-acme
+        
+    - name: Create nginx-acme user
+      user:
+        name: nginx-acme
+        system: yes
+        shell: /bin/false
+        home: /var/lib/nginx-acme
+        create_home: yes
+        
+    - name: Get step-ca root certificate
+      get_url:
+        url: "https://{{ step_ca_acme_url }}/root"
+        dest: /etc/pki/ca-trust/source/anchors/step-ca-root.crt
+        validate_certs: no
+      notify: update ca trust
+      
+    - name: Configure nginx-acme for step-ca
+      copy:
+        content: |
+          {
+            "acme_directory": "https://{{ step_ca_acme_url }}/acme/acme/directory",
+            "ca_bundle": "/etc/pki/tls/certs/ca-bundle.crt",
+            "account_key_path": "/var/lib/nginx-acme/account.key",
+            "challenge_dir": "/var/lib/nginx-acme/challenges",
+            "certificate_dir": "/etc/nginx-acme/certs",
+            "nginx_config_dir": "/etc/nginx/conf.d",
+            "reload_command": "systemctl reload nginx",
+            "verify_ssl": true,
+            "domains": [],
+            "hooks": {
+              "pre_issue": "/usr/local/bin/pre-cert-hook.sh",
+              "post_issue": "/usr/local/bin/post-cert-hook.sh"
+            }
+          }
+        dest: /etc/nginx-acme/config.json
+        owner: nginx-acme
+        group: nginx-acme
+        mode: '0600'
+        
+    - name: Configure nginx for ACME challenges and proxying
+      copy:
+        content: |
+          # ACME challenge handling
+          server {
+              listen 80;
+              server_name _;
+              
+              location /.well-known/acme-challenge/ {
+                  root /var/lib/nginx-acme/challenges;
+                  try_files $uri =404;
+              }
+              
+              # Redirect other traffic to HTTPS
+              location / {
+                  return 301 https://$host$request_uri;
+              }
+          }
+          
+          # Default HTTPS server with dynamic certificate loading
+          server {
+              listen 443 ssl http2;
+              server_name _;
+              
+              # Dynamic certificate selection based on SNI
+              ssl_certificate_by_lua_block {
+                  -- This would require OpenResty for dynamic cert loading
+                  -- Alternatively, use nginx-acme to reload config with new certs
+              }
+              
+              # Fallback certificates (will be replaced by nginx-acme)
+              ssl_certificate /etc/nginx-acme/certs/default.crt;
+              ssl_certificate_key /etc/nginx-acme/certs/default.key;
+              
+              ssl_protocols TLSv1.2 TLSv1.3;
+              ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384;
+              ssl_prefer_server_ciphers off;
+              
+              # Proxy to backend applications
+              location / {
+                  proxy_pass http://backend_pool;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+          
+          # Backend pool configuration
+          upstream backend_pool {
+              least_conn;
+              server backend1.internal:8080;
+              server backend2.internal:8080;
+          }
+        dest: /etc/nginx/conf.d/nginx-acme-proxy.conf
+      notify: reload nginx
+      
+    - name: Create certificate management hooks
+      copy:
+        content: |
+          #!/bin/bash
+          # Pre-certificate issuance hook
+          echo "$(date): Starting certificate issuance for $NGINX_ACME_DOMAIN" >> /var/log/nginx-acme.log
+        dest: /usr/local/bin/pre-cert-hook.sh
+        mode: '0755'
+        
+    - name: Create post-issuance hook
+      copy:
+        content: |
+          #!/bin/bash
+          # Post-certificate issuance hook
+          DOMAIN="$NGINX_ACME_DOMAIN"
+          CERT_PATH="/etc/nginx-acme/certs/${DOMAIN}.crt"
+          KEY_PATH="/etc/nginx-acme/certs/${DOMAIN}.key"
+          
+          # Update nginx configuration with new certificate
+          cat > "/etc/nginx/conf.d/${DOMAIN}.conf" << EOF
+          server {
+              listen 443 ssl http2;
+              server_name ${DOMAIN};
+              
+              ssl_certificate ${CERT_PATH};
+              ssl_certificate_key ${KEY_PATH};
+              
+              ssl_protocols TLSv1.2 TLSv1.3;
+              ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512;
+              
+              location / {
+                  proxy_pass http://backend_pool;
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+              }
+          }
+          EOF
+          
+          # Test and reload nginx
+          nginx -t && systemctl reload nginx
+          echo "$(date): Certificate installed for $DOMAIN" >> /var/log/nginx-acme.log
+        dest: /usr/local/bin/post-cert-hook.sh
+        mode: '0755'
+        
+    - name: Create nginx-acme systemd service
+      copy:
+        content: |
+          [Unit]
+          Description=NGINX ACME Certificate Manager (Step-CA Proxy)
+          After=network.target nginx.service step-ca.service
+          Wants=nginx.service
+          
+          [Service]
+          Type=simple
+          User=nginx-acme
+          Group=nginx-acme
+          WorkingDirectory=/var/lib/nginx-acme
+          ExecStart=/opt/nginx-acme/bin/nginx-acme --config /etc/nginx-acme/config.json --daemon
+          Restart=always
+          RestartSec=30
+          
+          # Environment for hooks
+          Environment=NGINX_ACME_CA_URL=https://{{ step_ca_acme_url }}/acme/acme/directory
+          
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/nginx-acme.service
+      notify: reload systemd
+      
+  handlers:
+    - name: update ca trust
+      command: update-ca-trust
+    - name: reload nginx
+      systemd:
+        name: nginx
+        state: reloaded
+    - name: reload systemd
+      systemd:
+        daemon_reload: yes
