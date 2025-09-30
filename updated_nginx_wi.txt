@@ -130,6 +130,10 @@ server {
     listen 443 ssl;
     server_name {{ nginx_server_name | default('_') }};
 
+    # DNS resolver - uses system resolver by default
+    resolver {{ nginx_resolver | default('127.0.0.1') }} valid=30s;
+    resolver_timeout 5s;
+
     # SSL configuration - update paths once certificates are obtained
     ssl_certificate /etc/nginx/ssl/{{ nginx_server_name | default('cert') }}.crt;
     ssl_certificate_key /etc/nginx/ssl/{{ nginx_server_name | default('cert') }}.key;
@@ -172,6 +176,7 @@ server {
 # Default variables
 nginx_server_name: example.com
 nginx_proxy_pass: http://127.0.0.1:8080
+nginx_resolver: 127.0.0.1  # Use system resolver, or set to 8.8.8.8, 1.1.1.1, etc.
 
 ---
 # Example playbook usage:
