@@ -7,3 +7,5 @@
 # 3. Receive certificate from internal CA
 # 4. Update nginx configuration
 # 5. Reload nginx with new certificate
+
+https://christiangn.medium.com/testing-the-native-nginx-http-01-acme-module-5109b42bafe4
