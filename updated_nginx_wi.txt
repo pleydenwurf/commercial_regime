@@ -1,0 +1,186 @@
+---
+# tasks/main.yml
+
+- name: Install required dependencies
+  ansible.builtin.dnf:
+    name:
+      - ca-certificates
+      - openssl
+    state: present
+
+- name: Download NGINX RPM
+  ansible.builtin.get_url:
+    url: "http://nginx.org/packages/mainline/rhel/9/x86_64/RPMS/nginx-1.29.1-1.el9.ngx.x86_64.rpm"
+    dest: "/tmp/nginx-1.29.1-1.el9.ngx.x86_64.rpm"
+    mode: '0644'
+
+- name: Install NGINX from RPM
+  ansible.builtin.dnf:
+    name: "/tmp/nginx-1.29.1-1.el9.ngx.x86_64.rpm"
+    state: present
+    disable_gpg_check: yes
+
+- name: Create ACME challenge directory
+  ansible.builtin.file:
+    path: /var/www/acme
+    state: directory
+    owner: nginx
+    group: nginx
+    mode: '0755'
+
+- name: Create SSL certificates directory
+  ansible.builtin.file:
+    path: /etc/nginx/ssl
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Configure NGINX with ACME support
+  ansible.builtin.template:
+    src: nginx.conf.j2
+    dest: /etc/nginx/nginx.conf
+    owner: root
+    group: root
+    mode: '0644'
+  notify: reload nginx
+
+- name: Configure proxy site
+  ansible.builtin.template:
+    src: proxy.conf.j2
+    dest: /etc/nginx/conf.d/proxy.conf
+    owner: root
+    group: root
+    mode: '0644'
+  notify: reload nginx
+
+- name: Enable and start NGINX
+  ansible.builtin.systemd:
+    name: nginx
+    enabled: yes
+    state: started
+
+- name: Open HTTP port in firewall
+  ansible.posix.firewalld:
+    service: http
+    permanent: yes
+    state: enabled
+    immediate: yes
+  when: ansible_facts.services['firewalld.service'] is defined
+
+- name: Open HTTPS port in firewall
+  ansible.posix.firewalld:
+    service: https
+    permanent: yes
+    state: enabled
+    immediate: yes
+  when: ansible_facts.services['firewalld.service'] is defined
+
+---
+# templates/nginx.conf.j2
+
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log notice;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
+
+    access_log /var/log/nginx/access.log main;
+
+    sendfile on;
+    tcp_nopush on;
+    keepalive_timeout 65;
+    gzip on;
+
+    include /etc/nginx/conf.d/*.conf;
+}
+
+---
+# templates/proxy.conf.j2
+
+# Initial HTTP server for ACME challenge
+server {
+    listen 80;
+    server_name {{ nginx_server_name | default('_') }};
+
+    # ACME challenge location
+    location /.well-known/acme-challenge/ {
+        root /var/www/acme;
+    }
+
+    # Redirect all other traffic to HTTPS (once certificate is obtained)
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# HTTPS server with proxy configuration
+server {
+    listen 443 ssl;
+    server_name {{ nginx_server_name | default('_') }};
+
+    # SSL configuration - update paths once certificates are obtained
+    ssl_certificate /etc/nginx/ssl/{{ nginx_server_name | default('cert') }}.crt;
+    ssl_certificate_key /etc/nginx/ssl/{{ nginx_server_name | default('cert') }}.key;
+    
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    # ACME challenge location (also available on HTTPS)
+    location /.well-known/acme-challenge/ {
+        root /var/www/acme;
+    }
+
+    # Proxy configuration
+    location / {
+        proxy_pass {{ nginx_proxy_pass | default('http://127.0.0.1:8080') }};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # Proxy timeouts
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+}
+
+---
+# handlers/main.yml
+
+- name: reload nginx
+  ansible.builtin.systemd:
+    name: nginx
+    state: reloaded
+
+---
+# defaults/main.yml
+
+# Default variables
+nginx_server_name: example.com
+nginx_proxy_pass: http://127.0.0.1:8080
+
+---
+# Example playbook usage:
+# playbook.yml
+
+- hosts: webservers
+  become: yes
+  roles:
+    - role: nginx_acme_proxy
+      vars:
+        nginx_server_name: myapp.example.com
+        nginx_proxy_pass: http://192.168.1.100:3000

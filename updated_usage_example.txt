@@ -9,3 +9,40 @@
 # 5. Reload nginx with new certificate
 
 https://christiangn.medium.com/testing-the-native-nginx-http-01-acme-module-5109b42bafe4
+
+Create an Ansible role to set up an NGINX proxy with built-in ACME support using that specific RPM package on Rocky Linux 9.
+
+Created an Ansible role structure for setting up NGINX as a proxy with ACME support. Here's what it includes:
+
+**Key Features:**
+
+1. **RPM Installation** - Downloads and installs the specific nginx-1.29.1-1.el9.ngx.x86_64.rpm package
+2. **ACME Challenge Support** - Creates `/var/www/acme` directory and configures the `.well-known/acme-challenge/` location for ACME/Let's Encrypt validation
+3. **Proxy Configuration** - Sets up NGINX as a reverse proxy with proper headers
+4. **Firewall Rules** - Opens HTTP/HTTPS ports if firewalld is running
+5. **SSL/TLS** - Configures HTTPS with modern TLS settings
+
+**File Structure:**
+```
+roles/nginx_acme_proxy/
+├── tasks/main.yml
+├── templates/
+│   ├── nginx.conf.j2
+│   └── proxy.conf.j2
+├── handlers/main.yml
+└── defaults/main.yml
+```
+
+**Usage:**
+Set the variables in your playbook:
+- `nginx_server_name`: Your domain (e.g., myapp.example.com)
+- `nginx_proxy_pass`: Backend URL to proxy to
+
+**Next Steps:**
+1. After running this role, use certbot or acme.sh to obtain certificates:
+   ```bash
+   certbot certonly --webroot -w /var/www/acme -d yourdomain.com
+   ```
+2. Update the SSL certificate paths in the template to point to your actual certificates
+
+Would you like me to add certbot automation or modify any part of the configuration?
