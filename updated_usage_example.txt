@@ -1,48 +1,60 @@
-# Add a new domain to be managed
-/usr/local/bin/nginx-acme-manager.sh app.internal.company.com
+---
+# KPX Proxy Configuration for Fedora Linux
+# Configuration file location: /etc/kpx.yaml
 
-# nginx-acme will:
-# 1. Contact step-CA ACME server
-# 2. Complete HTTP-01 challenge
-# 3. Receive certificate from internal CA
-# 4. Update nginx configuration
-# 5. Reload nginx with new certificate
+# Bind to localhost only (use 0.0.0.0 to listen on all interfaces)
+bind: 127.0.0.1
 
-https://christiangn.medium.com/testing-the-native-nginx-http-01-acme-module-5109b42bafe4
+# HTTP proxy port
+port: 8080
 
-Create an Ansible role to set up an NGINX proxy with built-in ACME support using that specific RPM package on Rocky Linux 9.
+# SOCKS proxy port (optional)
+socksPort: 8081
 
-Created an Ansible role structure for setting up NGINX as a proxy with ACME support. Here's what it includes:
+# Logging verbosity
+verbose: true
+debug: false
+trace: false
 
-**Key Features:**
+# Enable experimental console UI (optional)
+ui: false
 
-1. **RPM Installation** - Downloads and installs the specific nginx-1.29.1-1.el9.ngx.x86_64.rpm package
-2. **ACME Challenge Support** - Creates `/var/www/acme` directory and configures the `.well-known/acme-challenge/` location for ACME/Let's Encrypt validation
-3. **Proxy Configuration** - Sets up NGINX as a reverse proxy with proper headers
-4. **Firewall Rules** - Opens HTTP/HTTPS ports if firewalld is running
-5. **SSL/TLS** - Configures HTTPS with modern TLS settings
+# Timeout settings (in seconds)
+connectTimeout: 10
+idleTimeout: 0
+closeTimeout: 10
 
-**File Structure:**
-```
-roles/nginx_acme_proxy/
-├── tasks/main.yml
-├── templates/
-│   ├── nginx.conf.j2
-│   └── proxy.conf.j2
-├── handlers/main.yml
-└── defaults/main.yml
-```
+# Proxy definitions
+proxies:
+  # PAC-based proxy configuration
+  pac-proxy:
+    type: pac
+    # Use the local PAC file
+    url: file:///opt/proxy.pac
+    # No credentials needed if PAC returns anonymous proxies
+    # Add 'credentials: user' if PAC proxies require authentication
 
-**Usage:**
-Set the variables in your playbook:
-- `nginx_server_name`: Your domain (e.g., myapp.example.com)
-- `nginx_proxy_pass`: Backend URL to proxy to
+# Rules to determine which proxy to use for HTTP requests
+rules:
+  # Route all traffic through the PAC file
+  - host: "*"
+    proxy: pac-proxy
+    # Force DNS resolution through proxy (remote DNS)
+    dns: remote
 
-**Next Steps:**
-1. After running this role, use certbot or acme.sh to obtain certificates:
-   ```bash
-   certbot certonly --webroot -w /var/www/acme -d yourdomain.com
-   ```
-2. Update the SSL certificate paths in the template to point to your actual certificates
+# Rules for SOCKS proxy (optional, if socksPort is enabled)
+socksRules:
+  - host: "*"
+    proxy: pac-proxy
 
-Would you like me to add certbot automation or modify any part of the configuration?
+# List of IPs/CIDRs allowed to connect (empty = allow all)
+acl:
+  - 127.0.0.1
+  - 127.0.0.0/8
+
+# Check for updates (optional)
+check: false
+update: false
+
+# Use environment proxy variables for updates/PAC downloads
+useEnvProxy: false
